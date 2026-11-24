@@ -38,6 +38,9 @@ class BotService : AccessibilityService() {
     @Volatile private var runId = 0
     @Volatile private var lastShotAt = 0L
     @Volatile private var lastShotError = 0
+    @Volatile private var lastRotated = false
+    /** Flips the rotation applied to sideways screenshots, if the first guess turned out upside down. */
+    @Volatile private var flipRotation = false
     @Volatile var lastLog: String = ""
         private set
 
@@ -167,8 +170,10 @@ class BotService : AccessibilityService() {
                     hw?.recycle(); hb.close()
                     if (bmp != null) {
                         val size = displaySize()
-                        if ((bmp.width > bmp.height) != (size.x > size.y)) {
-                            val angle = if (displayRotation() == Surface.ROTATION_270) 90f else -90f
+                        lastRotated = (bmp.width > bmp.height) != (size.x > size.y)
+                        if (lastRotated) {
+                            var angle = if (displayRotation() == Surface.ROTATION_270) 90f else -90f
+                            if (flipRotation) angle = -angle
                             val m = Matrix().apply { postRotate(angle) }
                             val rotated = Bitmap.createBitmap(bmp, 0, 0, bmp.width, bmp.height, m, false)
                             bmp.recycle(); bmp = rotated
@@ -187,6 +192,22 @@ class BotService : AccessibilityService() {
         return out
     }
 
+    /**
+     * Captures and reads the screen. If the screenshot had to be rotated and reading fails,
+     * the opposite rotation is tried once and remembered.
+     */
+    private fun read(): Pair<Frame, RecognizeResult>? {
+        val f = capture() ?: return null
+        val rr = Recognizer.recognize(f)
+        val ok = rr.rec?.pieces?.any { it != null } == true
+        if (ok || !lastRotated) return f to rr
+        val n = f.px.size
+        val flipped = Frame(f.w, f.h, IntArray(n) { f.px[n - 1 - it] })
+        val rr2 = Recognizer.recognize(flipped)
+        if (rr2.rec?.pieces?.any { it != null } == true) { flipRotation = !flipRotation; return flipped to rr2 }
+        return f to rr
+    }
+
     private fun captureError(): String = when (lastShotError) {
         ERROR_TAKE_SCREENSHOT_SECURE_WINDOW -> "이 화면은 캡처가 막혀 있어요"
         ERROR_TAKE_SCREENSHOT_INTERVAL_TIME_SHORT -> "캡처 간격이 너무 짧아요"
@@ -199,8 +220,7 @@ class BotService : AccessibilityService() {
         var prevSig: String? = null
         repeat(tries) {
             if (runId != id) return null
-            val f = capture() ?: run { status(captureError()); return@repeat }
-            val rr = Recognizer.recognize(f)
+            val (f, rr) = read() ?: run { status(captureError()); return@repeat }
             val rec = rr.rec
             if (rec == null) { status(rr.error ?: "화면을 읽지 못했어요"); prevSig = null; return@repeat }
             val sig = rec.signature()
@@ -242,9 +262,9 @@ class BotService : AccessibilityService() {
         var lastSig: String? = null
         var shownSig: String? = null
         while (runId == id) {
-            val f = capture()
-            if (f == null) { status(captureError()); Thread.sleep(800); continue }
-            val rr = Recognizer.recognize(f)
+            val got = read()
+            if (got == null) { status(captureError()); Thread.sleep(800); continue }
+            val rr = got.second
             val rec = rr.rec
             if (rec == null) {
                 status(rr.error ?: "화면을 읽지 못했어요"); showHint(null, null)
@@ -416,11 +436,10 @@ class BotService : AccessibilityService() {
         status("진단 이미지를 만드는 중…")
         thread(name = "diag") {
             try {
-                val f = capture() ?: run { status(captureError()); return@thread }
-                val rr = Recognizer.recognize(f)
+                val (f, rr) = read() ?: run { status(captureError()); return@thread }
                 val plan = rr.rec?.let { rec -> rec.pieceArray().takeIf { ps -> ps.any { it != null } }?.let { Solver.solve(rec.board, it, prefs.strategy) } }
                 val info = listOf(
-                    "화면 ${f.w}x${f.h}, 회전 ${displayRotation()}",
+                    "화면 ${f.w}x${f.h}, 기기 ${displaySize().x}x${displaySize().y}, 회전 ${displayRotation()}, 캡처 회전 ${lastRotated}/${flipRotation}",
                     "드래그 보정: ${prefs.calibrationSummary()}",
                     "최근 상태: $lastLog",
                 )
