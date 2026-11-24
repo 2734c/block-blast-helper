@@ -65,7 +65,14 @@ object DragProbe {
         }
     }
 
-    fun locate(before: Frame, after: Frame, rec: Recognition, piece: Piece, expX: Float, expY: Float, radiusCells: Float): Found? {
+    /**
+     * @param ignore screen rectangles [left, top, right, bottom] whose changes are not evidence
+     *   (our own panel, the status bar, an animated ad banner). They are treated as unknown.
+     */
+    fun locate(
+        before: Frame, after: Frame, rec: Recognition, piece: Piece, expX: Float, expY: Float, radiusCells: Float,
+        ignore: List<IntArray> = emptyList(),
+    ): Found? {
         if (before.w != after.w || before.h != after.h) return null
         val cw = rec.geom.cellW
         val reach = (radiusCells + max(piece.w, piece.h) * 0.6f + 1.5f) * cw
@@ -74,6 +81,11 @@ object DragProbe {
         val grid = Grid(rx0, ry0, (rx1 - rx0) / G, (ry1 - ry0) / G)
         if (grid.gw < 4 || grid.gh < 4) return null
         for (by in 0 until grid.gh) for (bx in 0 until grid.gw) {
+            val cxb = rx0 + bx * G + G / 2; val cyb = ry0 + by * G + G / 2
+            if (ignore.any { cxb >= it[0] && cxb < it[2] && cyb >= it[1] && cyb < it[3] }) {
+                grid.d[by * grid.gw + bx] = 0; grid.u[by * grid.gw + bx] = grid.perBlock
+                continue
+            }
             var d = 0; var u = 0
             var y = ry0 + by * G
             while (y < ry0 + by * G + G) {

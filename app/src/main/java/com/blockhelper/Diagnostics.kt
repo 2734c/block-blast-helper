@@ -74,6 +74,38 @@ object Diagnostics {
         return "$rawName, $annName"
     }
 
+    /**
+     * Saves the screenshot taken while a block was held mid-drag, with marks:
+     * red = finger, yellow = where the block was expected, green = target, blue = where the block was found.
+     * marks = [fingerX, fingerY, expectedX, expectedY, targetX, targetY, foundX, foundY] (found < 0 = not found).
+     */
+    fun saveDrag(ctx: Context, f: Frame, marks: FloatArray, ignore: List<IntArray>, lines: List<String>): String {
+        val bmp = Bitmap.createBitmap(f.px, f.w, f.h, Bitmap.Config.ARGB_8888).copy(Bitmap.Config.ARGB_8888, true)
+        val c = Canvas(bmp)
+        val unit = f.w / 60f
+        val grey = Paint().apply { color = 0x55000000 }
+        for (r in ignore) c.drawRect(r[0].toFloat(), r[1].toFloat(), r[2].toFloat(), r[3].toFloat(), grey)
+        fun ring(x: Float, y: Float, color: Int) {
+            val pt = Paint(Paint.ANTI_ALIAS_FLAG).apply { style = Paint.Style.STROKE; strokeWidth = unit / 3; this.color = color }
+            c.drawCircle(x, y, unit, pt)
+            c.drawLine(x - unit * 1.6f, y, x + unit * 1.6f, y, pt)
+            c.drawLine(x, y - unit * 1.6f, x, y + unit * 1.6f, pt)
+        }
+        ring(marks[4], marks[5], Color.GREEN)
+        ring(marks[2], marks[3], Color.YELLOW)
+        if (marks[6] >= 0) ring(marks[6], marks[7], Color.BLUE)
+        ring(marks[0], marks[1], Color.RED)
+        val text = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.WHITE; textSize = f.w / 40f }
+        val all = listOf("빨강 손가락 · 노랑 예상 · 초록 목표 · 파랑 찾은 블록") + lines
+        val lh = text.textSize * 1.3f
+        c.drawRect(0f, 0f, f.w.toFloat(), lh * (all.size + 0.6f), Paint().apply { color = 0xCC000000.toInt() })
+        all.forEachIndexed { i, s -> c.drawText(s, 16f, lh * (i + 1), text) }
+        val name = "blockhelper_${System.currentTimeMillis()}_drag.png"
+        write(ctx, bmp, name)
+        bmp.recycle()
+        return name
+    }
+
     private fun write(ctx: Context, bmp: Bitmap, name: String) {
         val values = ContentValues().apply {
             put(MediaStore.Images.Media.DISPLAY_NAME, name)

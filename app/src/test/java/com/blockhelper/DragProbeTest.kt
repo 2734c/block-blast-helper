@@ -85,6 +85,21 @@ class DragProbeTest {
     }
 
     @Test
+    fun ignoresAnimatedBannerBelowTheTray() {
+        val (before, rec, piece) = setup()
+        val px = before.px.copyOf()
+        vacateSlot(px, before.w, rec)
+        // The ad banner changes to something block-coloured while the block is held.
+        for (y in 2140 until 2300) for (x in 300 until 1300) px[y * before.w + x] = green
+        val trueX = 720f; val trueY = 1300f
+        drawPiece(px, before.w, piece, trueX, trueY, rec.geom.cellW)
+        val ignore = listOf(intArrayOf(0, rec.trayBottom + 2, before.w, before.h))
+        val found = DragProbe.locate(before, Frame(before.w, before.h, px), rec, piece, 720f, 1700f, 5f, ignore)
+        assertNotNull(found)
+        assertTrue("found ${found!!.cx},${found.cy}", abs(found.cx - trueX) < 10f && abs(found.cy - trueY) < 10f)
+    }
+
+    @Test
     fun findsPieceAboveTheBoard() {
         val (before, rec, piece) = setup()
         val px = before.px.copyOf()

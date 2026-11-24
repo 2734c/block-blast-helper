@@ -124,7 +124,11 @@ class BotService : AccessibilityService() {
         updateButtons()
         when (m) {
             Mode.HINT -> { status("화면을 읽는 중…"); thread(name = "hint") { safeLoop(id) { hintLoop(id) } } }
-            Mode.AUTO -> { status("자동 플레이를 시작해요"); thread(name = "auto") { safeLoop(id) { autoLoop(id) } } }
+            Mode.AUTO -> {
+                dragRecordsLeft = 2
+                status("자동 플레이를 시작해요")
+                thread(name = "auto") { safeLoop(id) { autoLoop(id) } }
+            }
             Mode.IDLE -> {}
         }
     }
@@ -342,7 +346,8 @@ class BotService : AccessibilityService() {
                     prefs.setConfirmed(key, false)
                     landedShift(rec.board, tp.piece, mv, after.second.board)?.let { (dx, dy) ->
                         prefs.offset(key)?.let { (ox, oy) -> prefs.setOffset(key, ox + dx, oy + dy) }
-                        status("${dx}, ${dy}칸 어긋나서 보정했어요")
+                        prefs.setExact(key, false)
+                        status("${dx}, ${dy}칸 어긋나게 놓여서 보정했어요")
                     }
                 }
             }
@@ -360,33 +365,79 @@ class BotService : AccessibilityService() {
         return null
     }
 
+    /** Plausible offset of the dragged block from the finger, in cells. Anything else is a misreading. */
+    private fun saneOffset(o: Pair<Float, Float>) = o.first in -2.5f..2.5f && o.second in -6f..2f
+
+    /** Screen areas whose changes during a drag are not the block: status bar, ad banner, our panel. */
+    private fun ignoreRects(rec: Recognition, size: Point): List<IntArray> {
+        val out = arrayListOf(
+            intArrayOf(0, 0, size.x, (size.y * 0.03f).toInt()),
+            intArrayOf(0, rec.trayBottom + 2, size.x, size.y),
+        )
+        val latch = CountDownLatch(1)
+        var r: IntArray? = null
+        main.post {
+            panel?.let { v ->
+                val loc = IntArray(2); v.getLocationOnScreen(loc)
+                val m = (8 * resources.displayMetrics.density).toInt()
+                r = intArrayOf(loc[0] - m, loc[1] - m, loc[0] + v.width + m, loc[1] + v.height + m)
+            }
+            latch.countDown()
+        }
+        latch.await(1, TimeUnit.SECONDS)
+        r?.let { out.add(it) }
+        return out
+    }
+
+    @Volatile var lastDragLog: String = ""
+        private set
+    @Volatile private var dragRecordsLeft = 0
+
     /**
      * Drags a tray block onto the board. Unless the drop has been verified before (and fast drag is on),
      * it holds the block, takes a screenshot to see where the block (or the game's landing preview) is,
-     * corrects the finger position, and only then releases.
+     * corrects the finger position, and only then releases. Misreadings put the block back on the tray.
      */
     private fun drop(id: Int, before: Frame, rec: Recognition, tp: TrayPiece, mv: Move): Boolean {
         val p = tp.piece; val g = rec.geom
         val cw = g.cellW; val ch = g.cellH
         val size = displaySize()
-        fun clampX(x: Float) = x.coerceIn(2f, size.x - 3f)
-        fun clampY(y: Float) = y.coerceIn(2f, size.y - 3f)
+        fun onScreen(x: Float, y: Float) = x in 2f..(size.x - 3f) && y in 2f..(size.y - 3f)
         val tx = g.left + (mv.x + p.w / 2f) * cw
         val ty = g.top + (mv.y + p.h / 2f) * ch
         val key = "${p.w}x${p.h}"
-        val known = prefs.offset(key)
-        val guess = known ?: prefs.defaultOffset ?: (0f to -(p.h / 2f + 1f))
-        var curX = clampX(tx - guess.first * cw)
-        var curY = clampY(ty - guess.second * ch)
+        val known = prefs.offset(key)?.takeIf { saneOffset(it) }
+        val guess = known ?: prefs.defaultOffset?.takeIf { saneOffset(it) } ?: (0f to -(p.h / 2f + 1f))
+        var gainX = prefs.gainX.coerceIn(0.5f, 3f); var gainY = prefs.gainY.coerceIn(0.5f, 3f)
+        val ignore = ignoreRects(rec, size)
+        val log = StringBuilder()
+        log.append("블록 ${mv.slot + 1} ${p.key()} → ${mv.y + 1}행 ${mv.x + 1}열, 목표 중심 (%.0f, %.0f), 추정 오프셋 (%.2f, %.2f)칸\n".format(tx, ty, guess.first, guess.second))
+        var curX = (tx - guess.first * cw).coerceIn(2f, size.x - 3f)
+        var curY = (ty - guess.second * ch).coerceIn(2f, size.y - 3f)
+        var record: Pair<Frame, FloatArray>? = null // first mid-drag frame and marks, for the drag record
 
-        if (prefs.fastDrag && known != null && prefs.confirmed(key)) {
+        fun finish(result: Boolean, msg: String?): Boolean {
+            lastDragLog = log.toString()
+            msg?.let { status(it) }
+            if (record != null && dragRecordsLeft > 0) {
+                dragRecordsLeft--
+                val (frame, marks) = record!!
+                val text = log.toString().trim().lines() + listOf(if (result) "결과: 놓음" else "결과: 되돌림 - ${msg ?: ""}")
+                thread(name = "dragrec") { runCatching { Diagnostics.saveDrag(this, frame, marks, ignore, text) } }
+            }
+            return result
+        }
+
+        if (prefs.fastDrag && known != null && prefs.confirmed(key) && prefs.exact(key) && abs(gainX - 1f) < 0.05f && abs(gainY - 1f) < 0.05f) {
             val s = GestureDescription.StrokeDescription(line(tp.cx, tp.cy, curX, curY), 0, dragMs(), false)
-            return gesture(s).also { if (!it) status("드래그 입력이 취소됐어요") }
+            log.append("빠른 드래그: 손가락 (%.0f, %.0f)\n".format(curX, curY))
+            val ok = gesture(s)
+            return finish(ok, if (ok) null else "드래그 입력이 취소됐어요")
         }
 
         if (abs(curX - tp.cx) < 1f && abs(curY - tp.cy) < 1f) curX += 1f
         var stroke = GestureDescription.StrokeDescription(line(tp.cx, tp.cy, curX, curY), 0, dragMs(), true)
-        if (!gesture(stroke)) { status("드래그 입력이 취소됐어요"); return false }
+        if (!gesture(stroke)) return finish(false, "드래그 입력이 취소됐어요")
         Thread.sleep(120)
 
         fun moveTo(x: Float, y: Float, release: Boolean): Boolean {
@@ -401,32 +452,61 @@ class BotService : AccessibilityService() {
             // Put the block back on its tray slot.
             stroke = stroke.continueStroke(line(curX, curY, tp.cx, tp.cy), 0, dragMs(), false)
             gesture(stroke)
-            status(msg)
-            return false
+            log.append("되돌림: $msg\n")
+            return finish(false, msg)
+        }
+        fun release(ox: Float, oy: Float, exact: Boolean): Boolean {
+            prefs.setOffset(key, ox, oy); prefs.setExact(key, exact)
+            prefs.gainX = gainX; prefs.gainY = gainY
+            log.append("놓음: 손가락 (%.0f, %.0f)\n".format(curX, curY))
+            return finish(moveTo(curX, curY, true), null)
         }
 
-        for (iter in 0 until 3) {
+        var prev: FloatArray? = null // finger x, y and block x, y at the previous continuous reading
+        var expX = curX + guess.first * cw; var expY = curY + guess.second * ch
+        for (iter in 0 until 4) {
             if (runId != id) return cancel("멈췄어요")
             val mid = capture() ?: return cancel(captureError())
-            val expX = if (iter == 0) curX + guess.first * cw else tx
-            val expY = if (iter == 0) curY + guess.second * ch else ty
             val radius = if (iter == 0 && known == null) 5f else 2.5f
-            val found = DragProbe.locate(before, mid, rec, p, expX, expY, radius)
-                ?: return cancel("끌고 있는 블록을 화면에서 찾지 못했어요")
+            val found = DragProbe.locate(before, mid, rec, p, expX, expY, radius, ignore)
+            if (record == null) record = mid to floatArrayOf(curX, curY, expX, expY, tx, ty, found?.cx ?: -1f, found?.cy ?: -1f)
+            if (found == null) return cancel("끌고 있는 블록을 화면에서 찾지 못해서 되돌렸어요")
+            val ox = (found.cx - curX) / cw; val oy = (found.cy - curY) / ch
+            log.append("확인 ${iter + 1}: 손가락 (%.0f, %.0f) 블록 (%.0f, %.0f) 크기 %.2f %s → 오프셋 (%.2f, %.2f)칸\n".format(
+                curX, curY, found.cx, found.cy, found.scale, if (found.aligned) "격자 맞음(${found.landY + 1}행 ${found.landX + 1}열)" else "", ox, oy))
+            if (!saneOffset(ox to oy)) return cancel("블록 위치를 잘못 읽어서 되돌렸어요(손가락 기준 %.1f, %.1f칸)".format(ox, oy))
+
+            val nx: Float; val ny: Float
             if (found.aligned) {
                 // The landing cell is known exactly: move by whole cells.
-                prefs.setOffset(key, (found.cx - curX) / cw, (found.cy - curY) / ch)
-                if (found.landX == mv.x && found.landY == mv.y) return moveTo(curX, curY, true)
-                if (!moveTo(clampX(curX + (mv.x - found.landX) * cw), clampY(curY + (mv.y - found.landY) * ch), false)) return cancel("드래그 입력이 취소됐어요")
+                val dxc = mv.x - found.landX; val dyc = mv.y - found.landY
+                if (dxc == 0 && dyc == 0) return release(ox, oy, false)
+                if (iter == 3) return cancel("블록을 목표 자리에 맞추지 못해서 되돌렸어요")
+                nx = curX + dxc * cw / gainX; ny = curY + dyc * ch / gainY
+                expX = found.cx + dxc * cw; expY = found.cy + dyc * ch
             } else {
-                val ox = (found.cx - curX) / cw; val oy = (found.cy - curY) / ch
-                prefs.setOffset(key, ox, oy)
-                if (abs(found.cx - tx) < 0.12f * cw && abs(found.cy - ty) < 0.12f * ch) return moveTo(curX, curY, true)
-                if (!moveTo(clampX(tx - ox * cw), clampY(ty - oy * ch), false)) return cancel("드래그 입력이 취소됐어요")
+                // Learn how far the block moves per pixel of finger movement.
+                prev?.let { o ->
+                    val dfx = curX - o[0]; val dfy = curY - o[1]
+                    if (abs(dfx) > 0.3f * cw) gainX = ((found.cx - o[2]) / dfx).coerceIn(0.5f, 3f)
+                    if (abs(dfy) > 0.3f * ch) gainY = ((found.cy - o[3]) / dfy).coerceIn(0.5f, 3f)
+                }
+                prev = floatArrayOf(curX, curY, found.cx, found.cy)
+                val ex = tx - found.cx; val ey = ty - found.cy
+                if (abs(ex) < 0.12f * cw && abs(ey) < 0.12f * ch) return release(ox, oy, true)
+                if (iter == 3) {
+                    // Blocks snap to the nearest cell, so under half a cell off still lands right.
+                    return if (abs(ex) < 0.4f * cw && abs(ey) < 0.4f * ch) release(ox, oy, true)
+                    else cancel("블록을 목표 자리에 맞추지 못해서 되돌렸어요")
+                }
+                nx = curX + ex / gainX; ny = curY + ey / gainY
+                expX = tx; expY = ty
             }
+            if (!onScreen(nx, ny)) return cancel("목표 자리로 가려면 손가락이 화면 밖으로 나가야 해서 되돌렸어요")
+            if (!moveTo(nx, ny, false)) return cancel("드래그 입력이 취소됐어요")
             Thread.sleep(100)
         }
-        return moveTo(curX, curY, true)
+        return cancel("블록을 목표 자리에 맞추지 못해서 되돌렸어요")
     }
 
     // ---------------------------------------------------------------- diagnostics
@@ -442,7 +522,7 @@ class BotService : AccessibilityService() {
                     "화면 ${f.w}x${f.h}, 기기 ${displaySize().x}x${displaySize().y}, 회전 ${displayRotation()}, 캡처 회전 ${lastRotated}/${flipRotation}",
                     "드래그 보정: ${prefs.calibrationSummary()}",
                     "최근 상태: $lastLog",
-                )
+                ) + lastDragLog.trim().lines().filter { it.isNotBlank() }.map { "드래그: $it" }
                 val names = Diagnostics.save(this, f, rr, plan, info)
                 status("갤러리 Pictures/BlockHelper에 저장했어요: $names")
             } catch (t: Throwable) {
